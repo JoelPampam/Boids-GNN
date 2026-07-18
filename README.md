@@ -116,35 +116,6 @@ uint16   alignment_count
 uint32[] alignment_ids
 ```
 
-Example read loop (Python):
-
-```python
-import struct
-
-HEADER_FMT = "<IIffffB"
-header_size = struct.calcsize(HEADER_FMT)
-
-with open("boids_log.bin", "rb") as f:
-    data = f.read()
-
-offset = 0
-while offset < len(data):
-    step, boid_id, x, y, x_vel, y_vel, pre_planned = struct.unpack_from(
-        HEADER_FMT, data, offset
-    )
-    offset += header_size
-
-    neighbor_lists = []
-    for _ in range(3):  # separation, cohesion, alignment
-        (count,) = struct.unpack_from("<H", data, offset)
-        offset += 2
-        ids = struct.unpack_from(f"<{count}I", data, offset) if count else ()
-        offset += 4 * count
-        neighbor_lists.append(ids)
-
-    separation_ids, cohesion_ids, alignment_ids = neighbor_lists
-```
-
 ## Known limitations / next steps
 
 - Cohesion and alignment share a radius, making their graphs identical.
