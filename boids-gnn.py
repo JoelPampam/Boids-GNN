@@ -16,11 +16,31 @@ import struct
 # Radii used to decide adjacency -- these match the distances already used
 # inside Boid.separation / Boid.cohesion / Boid.alignment below.
 SEPARATION_RADIUS = 35
-COHESION_RADIUS = 100
+COHESION_RADIUS = 50
 ALIGNMENT_RADIUS = 100
+
+# Force weights -- how strongly each rule pulls on a boid's velocity.
+SEPARATION_WEIGHT = 0.02
+COHESION_WEIGHT = 0.001
+ALIGNMENT_WEIGHT = 0.05
+
+MIN_SPEED = 1
+MAX_SPEED = 4
 
 CSV_PATH = "boids_log.csv"
 BIN_PATH = "boids_log.bin"
+
+# How many simulation steps to record. Recording starts at step 0 and stops
+# automatically once this many steps have been logged (steps only advance
+# while unpaused, so pausing does not count against this budget).
+#0.016 between each step
+RECORD_STEPS = 500
+FPS = 60  # used only for the "elapsed time" message printed when done
+
+# If True, the whole program exits (closing the pygame window) the moment
+# recording finishes. If False, the simulation keeps running/visible but
+# no further rows are written to the log files.
+QUIT_WHEN_RECORDING_DONE = False
 
 CSV_FIELDS = [
     "step", "boid_id", "x", "y", "x_vel", "y_vel",
@@ -97,7 +117,7 @@ class Boid:
             dy = other.y - self.y
             distance = (dx**2 + dy**2) ** 0.5
 
-            if distance < 100:
+            if distance < COHESION_RADIUS:
                 center_x += other.x
                 center_y += other.y
                 count += 1
@@ -105,8 +125,8 @@ class Boid:
         if count > 0:
             center_x /= count
             center_y /= count
-            self.vx += (center_x - self.x) * 0.001
-            self.vy += (center_y - self.y) * 0.001
+            self.vx += (center_x - self.x) * COHESION_WEIGHT
+            self.vy += (center_y - self.y) * COHESION_WEIGHT
 
     def separation(self, boids):
         move_x = 0
@@ -119,19 +139,28 @@ class Boid:
             dy = other.y - self.y
             distance = (dx**2 + dy**2) ** 0.5
 
-            if distance < 35:
+            if distance < SEPARATION_RADIUS:
                 move_x -= dx
                 move_y -= dy
 
-        self.vx += move_x * 0.02
-        self.vy += move_y * 0.02
+        self.vx += move_x * SEPARATION_WEIGHT
+        self.vy += move_y * SEPARATION_WEIGHT
 
-    def limit_speed(self, max_speed):
+    def limit_speed(self, min_speed, max_speed):
         speed = (self.vx**2 + self.vy**2) ** 0.5    # total speed (distance formula)
 
         if speed > max_speed:
             self.vx = (self.vx / speed) * max_speed
             self.vy = (self.vy / speed) * max_speed
+        elif speed < min_speed:
+            if speed == 0:
+                # no direction to scale up from -- pick a random heading
+                angle = random.uniform(0, 2 * math.pi)
+                self.vx = math.cos(angle) * min_speed
+                self.vy = math.sin(angle) * min_speed
+            else:
+                self.vx = (self.vx / speed) * min_speed
+                self.vy = (self.vy / speed) * min_speed
 
     def alignment(self, boids):
         avg_vx = 0
@@ -145,7 +174,7 @@ class Boid:
             dy = other.y - self.y
             distance = (dx**2 + dy**2) ** 0.5
 
-            if distance < 100:
+            if distance < ALIGNMENT_RADIUS:
                 avg_vx += other.vx
                 avg_vy += other.vy
                 count += 1
@@ -153,8 +182,8 @@ class Boid:
         if count > 0:
             avg_vx /= count
             avg_vy /= count
-            self.vx += (avg_vx - self.vx) * 0.05
-            self.vy += (avg_vy - self.vy) * 0.05
+            self.vx += (avg_vx - self.vx) * ALIGNMENT_WEIGHT
+            self.vy += (avg_vy - self.vy) * ALIGNMENT_WEIGHT
 
     def avoid_obstacles(self, obstacles):
         for ox, oy, radius in obstacles:
@@ -186,7 +215,7 @@ class Boid:
         self.separation(boids)
         self.alignment(boids)
         self.avoid_obstacles(obstacles)
-        self.limit_speed(4)
+        self.limit_speed(MIN_SPEED, MAX_SPEED)
         self.x += self.vx
         self.y += self.vy
         self.enforce_no_overlap(obstacles)
@@ -254,10 +283,11 @@ def log_step(step, boids, csv_writer, bin_file):
 
 obstacles = []
 
-# create 100 boids
-boids = [Boid(i) for i in range(100)]
+# create 36 boids
+boids = [Boid(i) for i in range(36)]
 paused = False
 step = 0
+recording = True
 
 csv_file = open(CSV_PATH, "w", newline="")
 csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
@@ -265,9 +295,22 @@ csv_writer.writeheader()
 bin_file = open(BIN_PATH, "wb")
 
 
+def stop_recording():
+    """Close the log files. Safe to call more than once."""
+    global recording
+    if recording:
+        csv_file.flush()
+        bin_file.flush()
+        csv_file.close()
+        bin_file.close()
+        recording = False
+        print(f"Finished recording {step} steps ({step / FPS:.1f}s) to "
+              f"{CSV_PATH} and {BIN_PATH}")
+
+
 def shutdown():
-    csv_file.close()
-    bin_file.close()
+    if recording:
+        stop_recording()
     pygame.quit()
     sys.exit()
 
@@ -320,12 +363,17 @@ while True:
         for boid in boids:
             boid.update(boids)
 
-        log_step(step, boids, csv_writer, bin_file)
-        step += 1
+        if recording:
+            log_step(step, boids, csv_writer, bin_file)
+            step += 1
 
-        if step % 60 == 0:      # flush to disk roughly once a second
-            csv_file.flush()
-            bin_file.flush()
+            if step >= RECORD_STEPS:
+                stop_recording()
+                if QUIT_WHEN_RECORDING_DONE:
+                    shutdown()
+            elif step % FPS == 0:      # flush to disk roughly once a second
+                csv_file.flush()
+                bin_file.flush()
 
     for boid in boids:
         boid.draw(screen)
