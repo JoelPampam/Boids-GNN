@@ -1,128 +1,95 @@
-# Boids Simulation with Kinematic + Adjacency Logging
+# Boids GNN — Next-Step Velocity Prediction
 
-A 2D boids flocking simulation (Pygame) that logs per-timestep kinematic
-state and neighbor-graph information for every boid, intended as a data
-source for downstream graph neural network (GNN) work.
+A PyTorch Geometric model that learns to predict each boid's next-step
+velocity from the current simulation graph, trained on `boids_log.bin`
+produced by `boids.py`.
 
-## Contents
+## Task
 
-- `boids.py` — the simulation. Run it to open an interactive window and
-  simultaneously generate `boids_log.csv` and `boids_log.bin` in the
-  working directory.
+Given the graph at step *t* (each boid's position/velocity as node
+features, plus the separation/cohesion/alignment edges logged at that
+step), predict each boid's `[x_vel, y_vel]` at step *t+1*.
 
-## Requirements
+This is the standard starting task for GNNs on flocking/particle data —
+it uses every column already being logged, has an unambiguous ground
+truth (the next row), and is a natural stepping stone toward other tasks
+(leader/follower classification, link prediction, longer-horizon rollout)
+once it's working.
 
-- Python 3.9+
-- `pygame` (`pip install pygame`)
+## Files
 
-## Running
+| File | Purpose |
+|---|---|
+| `dataset.py` | Parses `boids_log.bin` and builds one PyG `Data` graph per step |
+| `model.py` | `BoidsGNN` — a small relational GCN |
+| `train.py` | Trains the model, saves `boids_gnn.pt` and `loss_curve.png` |
+| `requirements.txt` | `pip install -r requirements.txt` |
+
+## Data → graph mapping
+
+- **Node features** (`x`): `[x, y, x_vel, y_vel]`, normalized by the
+  known world size (900×650) and `MAX_SPEED` (4) from `boids.py`.
+- **Edges**: kept as **three separate edge sets** — `edge_index_sep`,
+  `edge_index_coh`, `edge_index_ali` — rather than collapsed into one
+  graph, since that's the whole point of logging three relation types.
+  An edge `j -> i` exists whenever boid `j` appeared in boid `i`'s
+  neighbor list for that relation at that step (i.e. `i` "receives" a
+  message from each of its detected neighbors).
+- **Target** (`y`): the same boid's `[x_vel, y_vel]` at the *next*
+  logged step, also normalized.
+- The last step in the log has no "next step," so it's dropped — 500
+  logged steps become 499 training graphs.
+
+## Model
+
+`BoidsGNN` is a simplified relational GCN: each layer runs a separate
+`GCNConv` for separation, cohesion, and alignment edges (plus a linear
+self-loop term) and sums the results, so the model can in principle learn
+different behavior per relation type rather than treating all neighbors
+identically. Two message-passing layers, hidden size 32, followed by a
+linear layer down to `[x_vel, y_vel]`.
+
+## Training
 
 ```bash
-python3 boids.py
+pip install -r requirements.txt
+python3 train.py /path/to/boids_log.bin
 ```
 
-A 900x650 window opens with 100 boids. Two output files are created (or
-overwritten) in the current directory the moment the script starts:
-`boids_log.csv` and `boids_log.bin`.
+- Split is **by time**, not shuffled — the first 80% of steps train, the
+  last 20% validate. A random split would leak future information into
+  training (steps close in time look very similar), so this keeps the
+  eval honest.
+- Batches multiple consecutive-step graphs together for efficiency; PyG's
+  batching automatically offsets our custom `edge_index_sep/coh/ali`
+  fields since they contain "index" in the name.
+- Loss: MSE on normalized velocity. 60 epochs, Adam, lr 1e-3 — all easy
+  to change at the top of `train.py`.
+- Outputs `boids_gnn.pt` (model weights) and `loss_curve.png`
+  (train/val loss over epochs).
 
-### Controls
+## Result on your data
 
-| Input | Action |
-|---|---|
-| `Space` | Pause / resume the simulation |
-| `Left click` | Place a circular obstacle at the cursor |
-| `Right click` | Remove the obstacle nearest the cursor |
-| `X` | Clear all obstacles |
-| `Esc` or close window | Stop the simulation and cleanly close the log files |
+Trained on your 500-step, 36-boid log (499 usable graphs → 400 train /
+99 val): validation MSE dropped from ~0.014 to ~0.0007 (normalized
+velocity units) over 60 epochs, with train and val loss tracking closely
+— no sign of overfitting at this size/epoch count.
 
-Logging only advances while the simulation is unpaused — pausing does not
-write new rows.
+## Ideas for next steps
 
-## Simulation model
-
-Each boid updates its velocity every step based on three classic flocking
-rules, plus obstacle avoidance:
-
-| Rule | Radius (px) | Effect |
-|---|---|---|
-| Separation | 35 | Steer away from boids that are too close |
-| Cohesion | 100 | Steer toward the average position of nearby boids |
-| Alignment | 100 | Match velocity with nearby boids |
-
-Boids also avoid user-placed obstacles and wrap around the screen edges.
-Speed is capped at 4 units/step.
-
-**Note:** Cohesion and alignment currently use the same radius (100), so
-their neighbor sets are identical at every step. If your GNN work needs
-these as distinct relation types with distinct topology, consider giving
-them different radii in `boids.py` (`COHESION_RADIUS` /
-`ALIGNMENT_RADIUS` constants near the top of the file).
-
-## Output: `boids_log.csv`
-
-One row per boid per simulation step. Header:
-
-```
-step,boid_id,x,y,x_vel,y_vel,pre_planned,separation,cohesion,alignment
-```
-
-| Column | Description |
-|---|---|
-| `step` | Simulation timestep index (increments once per unpaused frame) |
-| `boid_id` | Stable integer ID for the boid this row belongs to |
-| `x`, `y` | Position |
-| `x_vel`, `y_vel` | Velocity components |
-| `pre_planned` | `1` if this boid is following a precomputed path, else `0`. Currently always `0` — reserved for a not-yet-implemented feature. |
-| `separation` | IDs of boids within the separation radius of this boid, `-` delimited (e.g. `12-47-88`). Empty string if none. |
-| `cohesion` | IDs of boids within the cohesion radius, `-` delimited |
-| `alignment` | IDs of boids within the alignment radius, `-` delimited |
-
-### These columns as graphs
-
-`separation`, `cohesion`, and `alignment` are each an **adjacency list**
-for an undirected graph at that timestep: an edge connects boid *i* and
-boid *j* whenever their distance is under that rule's radius. Since
-distance is symmetric, each edge is currently listed on both endpoints'
-rows (i.e. the adjacency is stored redundantly, not as a deduplicated
-edge list). `x, y, x_vel, y_vel` double as node features for that same
-timestep.
-
-This is **not** yet in the `edge_index` COO format that PyTorch Geometric
-/ DGL expect. A conversion step (CSV/binary → per-step `edge_index`
-tensors) is needed before feeding this into most GNN libraries.
-
-## Output: `boids_log.bin`
-
-Same information as the CSV, packed as binary records for compactness.
-Little-endian. **Variable-length** — there is no fixed record size, so
-the file must be parsed sequentially from the start (read each count
-before reading its ID list).
-
-Per boid per step:
-
-```
-uint32   step
-uint32   boid_id
-float32  x
-float32  y
-float32  x_vel
-float32  y_vel
-uint8    pre_planned          (0 or 1)
-uint16   separation_count
-uint32[] separation_ids       (separation_count entries)
-uint16   cohesion_count
-uint32[] cohesion_ids
-uint16   alignment_count
-uint32[] alignment_ids
-```
-
-## Known limitations / next steps
-
-- Cohesion and alignment share a radius, making their graphs identical.
-- Adjacency is stored per-node rather than as a deduplicated edge list or
-  COO `edge_index` array — a conversion step is needed for direct use
-  with PyG/DGL.
-- No fixed episode length; the simulation logs indefinitely until the
-  window is closed.
-- `pre_planned` is a placeholder field, not yet driven by any actual
-  precomputed-path logic.
+- **Longer-horizon prediction**: instead of 1 step ahead, predict *k*
+  steps ahead, or do autoregressive rollout (feed predictions back in as
+  input) and see how far it stays stable.
+- **Position instead of / in addition to velocity**: trickier because of
+  screen-wrap discontinuities — would need to predict a bounded delta
+  and handle wrap explicitly, or switch the sim to a bounded (non-wrapping)
+  world first.
+- **Edge features**: currently edges are just "present/absent" per
+  relation. Distance itself could be an edge feature (e.g. via
+  `GCNConv`'s edge_weight, or switching to `NNConv`/`GATConv` with edge
+  attributes).
+- **Leader/follower classification**: once `pre_planned` boids are
+  actually implemented in the sim (currently always `False`), this
+  becomes a node classification task on the same graphs.
+- **Link prediction**: predict which separation/cohesion/alignment edges
+  will exist at *t+1*, rather than (or in addition to) velocity.
